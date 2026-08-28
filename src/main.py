@@ -5,12 +5,25 @@ from datetime import datetime, timezone
 import requests
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, ValidationError
 
 BASE_URL = "https://books.toscrape.com"
 CACHE_DIR = "cache"
 USER_AGENT = "FlyRankInternshipA9/1.0 (+https://github.com/AliHaikal/scraper)"
 TIMEOUT_SECONDS = 10
 DELAY_SECONDS = 0.5
+
+
+class BookRecord(BaseModel):
+    title: str
+    product_url: str
+    price_gbp: float
+    price_text: str
+    availability_text: str
+    rating_text: str | None
+    description: str | None
+    source_page: str
+    fetched_at: str
 
 
 def fetch_page(url: str, cache_filename: str) -> str:
@@ -90,6 +103,7 @@ def discover_all_book_urls(max_pages: int = 3) -> list[tuple[str, str]]:
 
     return unique_links
 
+
 def extract_book_record(html: str, product_url: str, source_page: str) -> dict:
     """Pull the raw fields out of a single book detail page."""
     soup = BeautifulSoup(html, "html.parser")
@@ -138,7 +152,50 @@ def extract_all_books(book_urls_with_source: list[tuple[str, str]]) -> list[dict
     print(f"detail_pages={len(records)}")
     return records
 
+
+def normalize_record(raw: dict) -> dict:
+    """Turn a raw record's price_text into a numeric price_gbp, keeping the original text too."""
+    price_text = raw["price_text"]
+    # strip everything except digits and the decimal point (handles "£51.77", stray whitespace, etc.)
+    numeric_part = "".join(ch for ch in price_text if ch.isdigit() or ch == ".")
+    price_gbp = float(numeric_part)
+
+    normalized = dict(raw)
+    normalized["price_gbp"] = price_gbp
+    return normalized
+
+
+def validate_and_store(raw_records: list[dict]) -> None:
+    """Normalize, validate, dedupe by product_url, and write books.json / errors.json."""
+    seen_urls = set()
+    valid_records = []
+    error_records = []
+
+    for raw in raw_records:
+        try:
+            normalized = normalize_record(raw)
+            validated = BookRecord(**normalized)
+        except (ValueError, ValidationError) as e:
+            error_records.append({"record": raw, "reason": str(e)})
+            continue
+
+        if validated.product_url in seen_urls:
+            continue  # dedupe by canonical URL — keep first occurrence only
+        seen_urls.add(validated.product_url)
+        valid_records.append(validated.model_dump())
+
+    os.makedirs("output", exist_ok=True)
+    with open("output/books.json", "w", encoding="utf-8") as f:
+        json.dump(valid_records, f, indent=2, ensure_ascii=False)
+
+    with open("output/errors.json", "w", encoding="utf-8") as f:
+        json.dump(error_records, f, indent=2, ensure_ascii=False)
+
+    print(f"valid_records={len(valid_records)}")
+    print(f"invalid_records={len(error_records)}")
+
+
 if __name__ == "__main__":
     book_urls = discover_all_book_urls()
     records = extract_all_books(book_urls)
-    print(json.dumps(records[0], indent=2, ensure_ascii=False))
+    validate_and_store(records)
