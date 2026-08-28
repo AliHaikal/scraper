@@ -3,7 +3,7 @@ import requests
 
 BASE_URL = "https://books.toscrape.com"
 CACHE_DIR = "cache"
-USER_AGENT = "FlyRankInternshipA9/1.0 (+https://github.com/AliHaikal/todo-api-fastapi)"
+USER_AGENT = "FlyRankInternshipA9/1.0 (+https://github.com/AliHaikal/scraper)"
 TIMEOUT_SECONDS = 10
 
 
