@@ -26,31 +26,61 @@ class BookRecord(BaseModel):
     fetched_at: str
 
 
-def fetch_page(url: str, cache_filename: str) -> str:
-    """Fetch a page, using the cache if it already exists locally."""
+class FetchError(Exception):
+    """Raised when a page can't be fetched. status_code is None for network-level failures (e.g. timeout)."""
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def fetch_page(url: str, cache_filename: str, stats: dict | None = None) -> str:
+    """Fetch a page, using the cache if it already exists locally. Retries once on timeout/5xx."""
     cache_path = os.path.join(CACHE_DIR, cache_filename)
 
     if os.path.exists(cache_path):
         with open(cache_path, "r", encoding="utf-8") as f:
             html = f.read()
         print(f"CACHE HIT: {cache_filename} ({len(html)} bytes)")
+        if stats is not None:
+            stats["cache_hits"] += 1
         return html
 
     headers = {"User-Agent": USER_AGENT}
-    response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
+    last_error = None
 
-    if response.status_code != 200:
-        raise Exception(f"Failed to fetch {url}: status {response.status_code}")
+    for attempt in range(2):  # one try + one retry
+        try:
+            response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
+        except requests.exceptions.RequestException as e:
+            last_error = FetchError(f"Network error fetching {url}: {e}")
+            if attempt == 0:
+                time.sleep(1)
+                continue
+            raise last_error
 
-    response.encoding = "utf-8"
-    html = response.text
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    with open(cache_path, "w", encoding="utf-8") as f:
-        f.write(html)
+        if response.status_code == 200:
+            response.encoding = "utf-8"
+            html = response.text
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                f.write(html)
+            print(f"FETCH: {cache_filename} ({len(html)} bytes)")
+            time.sleep(DELAY_SECONDS)
+            if stats is not None:
+                stats["pages_fetched"] += 1
+            return html
 
-    print(f"FETCH: {cache_filename} ({len(html)} bytes)")
-    time.sleep(DELAY_SECONDS)  # be polite — only matters on a real fetch, cache hits skip this
-    return html
+        if response.status_code in (404, 403):
+            # do not retry: 404 won't appear later, 403 means the site said no
+            raise FetchError(f"Failed to fetch {url}: status {response.status_code}", response.status_code)
+
+        if response.status_code >= 500 and attempt == 0:
+            time.sleep(1)
+            continue
+
+        raise FetchError(f"Failed to fetch {url}: status {response.status_code}", response.status_code)
+
+    raise last_error
 
 
 def extract_book_links(html: str, page_url: str) -> list[str]:
@@ -73,7 +103,7 @@ def get_next_page_url(html: str, page_url: str) -> str | None:
     return urljoin(page_url, next_link["href"])
 
 
-def discover_all_book_urls(max_pages: int = 3) -> list[tuple[str, str]]:
+def discover_all_book_urls(stats: dict, max_pages: int = 3) -> list[tuple[str, str]]:
     """Walk the catalogue from page 1, following 'next' links, collecting (book_url, source_page) pairs."""
     all_links = []
     page_num = 1
@@ -81,7 +111,7 @@ def discover_all_book_urls(max_pages: int = 3) -> list[tuple[str, str]]:
 
     while page_url and page_num <= max_pages:
         cache_filename = f"catalogue-page-{page_num}.html"
-        html = fetch_page(page_url, cache_filename)
+        html = fetch_page(page_url, cache_filename, stats)
 
         page_links = extract_book_links(html, page_url)
         for link in page_links:
@@ -140,14 +170,18 @@ def cache_filename_for_book(product_url: str) -> str:
     return f"book-{slug}.html"
 
 
-def extract_all_books(book_urls_with_source: list[tuple[str, str]]) -> list[dict]:
-    """Fetch every book detail page and extract its raw record."""
+def extract_all_books(book_urls_with_source: list[tuple[str, str]], stats: dict) -> list[dict]:
+    """Fetch every book detail page and extract its raw record. One bad page is logged and skipped."""
     records = []
     for product_url, source_page in book_urls_with_source:
         cache_filename = cache_filename_for_book(product_url)
-        html = fetch_page(product_url, cache_filename)
-        record = extract_book_record(html, product_url, source_page)
-        records.append(record)
+        try:
+            html = fetch_page(product_url, cache_filename, stats)
+            record = extract_book_record(html, product_url, source_page)
+            records.append(record)
+        except FetchError as e:
+            print(f"FAILED: {product_url} ({e})")
+            stats["failed_pages"] += 1
 
     print(f"detail_pages={len(records)}")
     return records
@@ -195,7 +229,47 @@ def validate_and_store(raw_records: list[dict]) -> None:
     print(f"invalid_records={len(error_records)}")
 
 
+def write_run_report(stats: dict, start_time: datetime, valid_count: int, invalid_count: int) -> None:
+    """Write a short honest report of what happened during the run."""
+    end_time = datetime.now(timezone.utc)
+    duration_seconds = (end_time - start_time).total_seconds()
+
+    report = {
+        "start_time": start_time.isoformat(),
+        "duration_seconds": round(duration_seconds, 2),
+        "pages_fetched": stats["pages_fetched"],
+        "cache_hits": stats["cache_hits"],
+        "valid_records": valid_count,
+        "invalid_records": invalid_count,
+        "failed_pages": stats["failed_pages"],
+    }
+
+    os.makedirs("output", exist_ok=True)
+    with open("output/run-report.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+
+    print(json.dumps(report, indent=2))
+
+
 if __name__ == "__main__":
-    book_urls = discover_all_book_urls()
-    records = extract_all_books(book_urls)
+    start_time = datetime.now(timezone.utc)
+    stats = {"pages_fetched": 0, "cache_hits": 0, "failed_pages": 0}
+
+    book_urls = discover_all_book_urls(stats)
+
+    # Stage 5 checkpoint: prove one bad page doesn't kill the run.
+    # Leave this commented in after you've confirmed it once — it's your proof.
+    # book_urls.append((
+    #     f"{BASE_URL}/catalogue/this-book-does-not-exist_9999/index.html",
+    #     f"{BASE_URL}/catalogue/page-1.html",
+    # ))
+
+    records = extract_all_books(book_urls, stats)
     validate_and_store(records)
+
+    with open("output/books.json", "r", encoding="utf-8") as f:
+        valid_count = len(json.load(f))
+    with open("output/errors.json", "r", encoding="utf-8") as f:
+        invalid_count = len(json.load(f))
+
+    write_run_report(stats, start_time, valid_count, invalid_count)
